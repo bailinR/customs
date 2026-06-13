@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive } from "vue";
 import ComtradeSelect from "./components/ComtradeSelect.vue";
+import ScheduleTimePicker from "./components/ScheduleTimePicker.vue";
 
 const meta = reactive({
   reporters: [],
@@ -826,6 +827,122 @@ const gaccFormReady = computed(() => {
   );
 });
 
+const SCHEDULE_STORAGE = {
+  comtrade: "customsR.schedule.comtrade",
+  gacc: "customsR.schedule.gacc",
+};
+
+const comtradeSchedule = reactive({
+  enabled: false,
+  time: "02:00",
+  lastRunKey: "",
+});
+
+const gaccSchedule = reactive({
+  enabled: false,
+  time: "09:00",
+  lastRunKey: "",
+});
+
+let scheduleTimer = null;
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function scheduleRunKey(timeStr) {
+  const now = new Date();
+  return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${timeStr}`;
+}
+
+function matchesScheduleTime(timeStr) {
+  if (!timeStr) return false;
+  const [h, m] = timeStr.split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return false;
+  const now = new Date();
+  return now.getHours() === h && now.getMinutes() === m;
+}
+
+function loadSchedule(mode) {
+  const target = mode === "gacc" ? gaccSchedule : comtradeSchedule;
+  try {
+    const raw = localStorage.getItem(SCHEDULE_STORAGE[mode]);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (typeof data.enabled === "boolean") target.enabled = data.enabled;
+    if (typeof data.time === "string" && data.time) target.time = data.time;
+    if (typeof data.lastRunKey === "string") target.lastRunKey = data.lastRunKey;
+  } catch {
+    /* ignore corrupt localStorage */
+  }
+}
+
+function persistSchedule(mode) {
+  const target = mode === "gacc" ? gaccSchedule : comtradeSchedule;
+  localStorage.setItem(
+    SCHEDULE_STORAGE[mode],
+    JSON.stringify({
+      enabled: target.enabled,
+      time: target.time,
+      lastRunKey: target.lastRunKey,
+    }),
+  );
+}
+
+function scheduleHint(schedule, ready, busy) {
+  if (!schedule.enabled) return "未启用定时任务";
+  if (busy) return `已启用：每天 ${schedule.time}（当前任务进行中）`;
+  if (!ready) return `已启用：每天 ${schedule.time}（请先填完整表单）`;
+  if (schedule.lastRunKey) {
+    return `已启用：每天 ${schedule.time} · 上次 ${schedule.lastRunKey}`;
+  }
+  return `已启用：每天 ${schedule.time} · 到点自动执行（需保持页面打开）`;
+}
+
+async function tickSchedules() {
+  if (
+    comtradeSchedule.enabled &&
+    matchesScheduleTime(comtradeSchedule.time) &&
+    syncFormReady.value &&
+    !syncState.syncing
+  ) {
+    const key = scheduleRunKey(comtradeSchedule.time);
+    if (comtradeSchedule.lastRunKey !== key) {
+      comtradeSchedule.lastRunKey = key;
+      persistSchedule("comtrade");
+      await onSyncSlice();
+    }
+  }
+
+  if (
+    gaccSchedule.enabled &&
+    matchesScheduleTime(gaccSchedule.time) &&
+    gaccFormReady.value &&
+    !gaccState.querying
+  ) {
+    const key = scheduleRunKey(gaccSchedule.time);
+    if (gaccSchedule.lastRunKey !== key) {
+      gaccSchedule.lastRunKey = key;
+      persistSchedule("gacc");
+      await onGaccQuery();
+    }
+  }
+}
+
+function startScheduleTimer() {
+  stopScheduleTimer();
+  scheduleTimer = setInterval(() => {
+    tickSchedules();
+  }, 15000);
+}
+
+function stopScheduleTimer() {
+  if (scheduleTimer) {
+    clearInterval(scheduleTimer);
+    scheduleTimer = null;
+  }
+}
+
 const gaccMonthOptions = computed(() => {
   const year = Number(gaccForm.year);
   const max =
@@ -1080,6 +1197,9 @@ function goPage(page) {
 }
 
 onMounted(async () => {
+  loadSchedule("comtrade");
+  loadSchedule("gacc");
+  startScheduleTimer();
   try {
     await Promise.all([fetchMeta(), fetchSyncOptions()]);
     await fetchTrade(1);
@@ -1090,6 +1210,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopGaccPoll();
+  stopScheduleTimer();
 });
 </script>
 
@@ -1247,6 +1368,36 @@ onUnmounted(() => {
               {{ syncState.result.message }}
             </template>
           </div>
+
+          <section class="schedule-panel">
+            <h3 class="schedule-title">定时同步</h3>
+            <label class="force-refresh">
+              <input
+                v-model="comtradeSchedule.enabled"
+                type="checkbox"
+                @change="persistSchedule('comtrade')"
+              />
+              启用每日定时
+            </label>
+            <div class="field schedule-time-field">
+              <label for="comtrade-schedule-hour">执行时间</label>
+              <ScheduleTimePicker
+                v-model="comtradeSchedule.time"
+                hour-id="comtrade-schedule-hour"
+                minute-id="comtrade-schedule-minute"
+                @change="persistSchedule('comtrade')"
+              />
+            </div>
+            <p class="schedule-hint">
+              {{
+                scheduleHint(
+                  comtradeSchedule,
+                  syncFormReady,
+                  syncState.syncing,
+                )
+              }}
+            </p>
+          </section>
         </template>
       </template>
     </aside>
@@ -1419,6 +1570,32 @@ onUnmounted(() => {
             <strong>任务 {{ gaccState.job.id }} 失败</strong>
             <span>{{ gaccState.job.error_message }}</span>
           </div>
+
+          <section class="schedule-panel">
+            <h3 class="schedule-title">定时采集</h3>
+            <label class="force-refresh">
+              <input
+                v-model="gaccSchedule.enabled"
+                type="checkbox"
+                @change="persistSchedule('gacc')"
+              />
+              启用每日定时
+            </label>
+            <div class="field schedule-time-field">
+              <label for="gacc-schedule-hour">执行时间</label>
+              <ScheduleTimePicker
+                v-model="gaccSchedule.time"
+                hour-id="gacc-schedule-hour"
+                minute-id="gacc-schedule-minute"
+                @change="persistSchedule('gacc')"
+              />
+            </div>
+            <p class="schedule-hint">
+              {{
+                scheduleHint(gaccSchedule, gaccFormReady, gaccState.querying)
+              }}
+            </p>
+          </section>
         </section>
       </template>
     </aside>
@@ -1461,7 +1638,7 @@ onUnmounted(() => {
               :class="{ active: activeView.mode === 'gacc' }"
               @click="switchView('gacc')"
             >
-              中国海关在线查询
+              海关在线查询
             </button>
           </nav>
         </div>

@@ -29,17 +29,22 @@ from gacc_captcha_scope import (
 )
 from gacc_slider_solver import (
     MAX_TRIES_PER_CAPTCHA,
-    block_left_to_slider,
+    build_detection_targets,
     build_initial_targets,
     captcha_failed,
+    compute_drag_distance,
+    detect_gap_x_detailed,
     drag_captcha_handle,
+    ensure_slider_block_reset,
+    expand_targets_from_block_landing,
+    expand_targets_from_gap_x,
     expand_targets_from_landing,
     parse_layout,
+    puzzle_block_width,
     read_block_left,
     read_captcha_msg,
     read_slider_offset,
     reset_slider_position,
-    solve_from_meta,
     track_travel_from_layout,
 )
 
@@ -229,6 +234,7 @@ CAPTCHA_META_JS = """
     handleBox: rect(handle),
     trackBox: track ? rect(track) : rect(handle),
     puzzleDataUrl: puzzleCanvas ? canvasToDataUrl(puzzleCanvas) : null,
+    blockWidth: puzzleCanvas ? puzzleCanvas.width : 62,
     offsetPx: 0,
   };
 }
@@ -684,9 +690,12 @@ class AutoSliderCaptchaProvider:
                     self._pause(0.5)
                     continue
                 _focus_page(cs.page)
-                solved = self._try_auto_solve(cs)
+                solved, phase = self._try_auto_solve(cs)
                 if solved:
                     self._attempts_for_current = 0
+                    self._pause(0.8)
+                    continue
+                if phase == "retry":
                     self._pause(0.8)
                     continue
                 self._attempts_for_current += 1
@@ -743,8 +752,8 @@ class AutoSliderCaptchaProvider:
             return "pass"
         return "pending"
 
-    def _wait_captcha_outcome(self, scope: Page | Frame, page: Page, *, rounds: int = 20) -> str:
-        page.wait_for_timeout(800)
+    def _wait_captcha_outcome(self, scope: Page | Frame, page: Page, *, rounds: int = 24) -> str:
+        page.wait_for_timeout(900)
         outcome = self._captcha_outcome(scope, page)
         if outcome != "pending":
             return outcome
@@ -769,15 +778,17 @@ class AutoSliderCaptchaProvider:
         page = cs.page
         scope = cs.scope
         if reset_first:
-            reset_slider_position(page, handle_loc, scope=scope)
-            self._pause(0.35)
+            if not ensure_slider_block_reset(page, handle_loc, scope):
+                reset_slider_position(page, handle_loc, scope=scope)
+            self._pause(0.25)
         left_before = read_slider_offset(scope)
         final_left = drag_captcha_handle(page, handle_loc, target, [], scope=scope)
         moved = final_left - left_before
         self._notify(f"滑块 offset={int(final_left)}px（目标 {int(target)}，移动 {int(moved)}px）")
         return final_left
 
-    def _try_auto_solve(self, cs: CaptchaScope) -> bool:
+    def _try_auto_solve(self, cs: CaptchaScope) -> tuple[bool, str]:
+        """Return (solved, phase). phase: ok | retry | exhausted."""
         page = cs.page
         scope = cs.scope
 
@@ -785,47 +796,81 @@ class AutoSliderCaptchaProvider:
             scope.locator("#captcha").first.wait_for(state="visible", timeout=8000)
         except PlaywrightTimeout:
             self._notify("等待 #captcha 验证码弹窗…")
-            return False
+            return False, "retry"
 
-        if _reset_captcha(cs):
-            self._notify("已刷新验证码，重置滑块…")
-            _wait_captcha_ready(cs, closed=self._abort)
+        handle_loc = scope.locator(CAPTCHA_HANDLE).first
+        slider_left = read_slider_offset(scope)
+        if captcha_failed(scope) or slider_left > 3:
+            reset_slider_position(page, handle_loc, scope=scope)
+            page.wait_for_timeout(400)
 
         meta = _extract_captcha_meta_from_scope(cs)
         if not meta:
             diag = format_diagnostics(page.context, cs)
             self._notify(f"未识别到滑块元素 | {diag[:500]}")
             save_diagnostics(page.context, cs, out_path=Path("data/gacc_captcha_last_fail.json"))
-            return False
-        try:
-            distance, gap_x, confidence = solve_from_meta(meta)
-        except Exception as exc:
-            self._notify(f"缺口识别失败：{exc}")
-            return False
+            return False, "retry"
 
         layout = parse_layout(meta)
+        try:
+            from gacc_slider_solver import decode_data_url
+
+            bg = decode_data_url(meta["bgDataUrl"])
+            puzzle = None
+            if meta.get("puzzleDataUrl") and not meta["puzzleDataUrl"].startswith("data:,"):
+                puzzle = decode_data_url(meta["puzzleDataUrl"], keep_alpha=True)
+            detail = detect_gap_x_detailed(bg, puzzle)
+            if puzzle is not None:
+                layout.block_width = puzzle_block_width(puzzle, layout.block_width)
+            distance = compute_drag_distance(
+                detail.gap_x_float,
+                bg_width=layout.bg_width or int(meta.get("bgNaturalWidth") or bg.shape[1]),
+                block_width=layout.block_width,
+                track_width=layout.track_width or layout.bg_box_width,
+                handle_width=layout.handle_width,
+                offset_px=layout.offset_px,
+            )
+            gap_x = max(0, detail.gap_x)
+            confidence = detail.confidence
+        except Exception as exc:
+            self._notify(f"缺口识别失败：{exc}")
+            return False, "retry"
         track_travel = track_travel_from_layout(layout)
-        handle_loc = scope.locator(CAPTCHA_HANDLE).first
 
         if distance < 8:
-            self._notify(f"识别距离过短（{int(distance)}px），刷新验证码…")
-            _click_captcha_refresh(cs)
-            return False
+            self._notify(
+                f"识别距离偏短（{distance:.1f}px），仍尝试拖动并在同图微调…"
+            )
 
         conf_pct = int(confidence * 100)
+        method_label = (
+            "纯白缺口"
+            if detail.method == "white_hole"
+            else ("白边" if detail.method == "white_rim" else detail.method)
+        )
         self._notify(
-            f"缺口≈{gap_x}px → 滑块目标 {distance:.1f}px（置信 {conf_pct}%）"
+            f"缺口≈{gap_x}px → 滑块目标 {distance:.1f}px（{method_label}，置信 {conf_pct}%）"
         )
 
         seen_targets: set[int] = set()
         targets: list[float] = []
+        for t in build_detection_targets(detail, layout, track_travel=track_travel):
+            ti = int(round(t))
+            if ti not in seen_targets:
+                seen_targets.add(ti)
+                targets.append(t)
         for t in build_initial_targets(distance, track_travel):
             ti = int(round(t))
             if ti not in seen_targets:
                 seen_targets.add(ti)
                 targets.append(t)
 
+        if not targets:
+            self._notify("未生成有效滑块目标，稍后重试…")
+            return False, "retry"
+
         idx = 0
+        dragged = False
         while idx < len(targets) and idx < MAX_TRIES_PER_CAPTCHA:
             target = targets[idx]
             if idx > 0:
@@ -836,6 +881,7 @@ class AutoSliderCaptchaProvider:
                 final_left = self._drag_to_target(
                     cs, handle_loc, target, reset_first=idx > 0
                 )
+                dragged = True
             except (PlaywrightError, RuntimeError, ValueError) as exc:
                 if idx == 0:
                     diag = format_diagnostics(page.context, cs)
@@ -853,29 +899,70 @@ class AutoSliderCaptchaProvider:
             if outcome == "pass":
                 self._notify("拼图验证通过")
                 self._confirm_captcha_passed(cs, page)
-                return True
+                return True, "ok"
+            if outcome == "pending":
+                block_left = read_block_left(scope)
+                if block_left > 0 and abs(block_left - gap_x) > 2:
+                    bg_w = layout.bg_width or int(meta.get("bgNaturalWidth") or 310)
+                    tw = layout.track_width or layout.bg_box_width
+                    corr = compute_drag_distance(
+                        float(gap_x),
+                        bg_width=bg_w,
+                        block_width=layout.block_width,
+                        track_width=tw,
+                        handle_width=layout.handle_width,
+                        offset_px=layout.offset_px,
+                    )
+                    if abs(corr - final_left) >= 2:
+                        try:
+                            final_left = self._drag_to_target(
+                                cs, handle_loc, corr, reset_first=False
+                            )
+                            outcome = self._wait_captcha_outcome(scope, page, rounds=12)
+                            if outcome == "pass":
+                                self._notify("拼图验证通过（二次微调）")
+                                self._confirm_captcha_passed(cs, page)
+                                return True, "ok"
+                        except (PlaywrightError, RuntimeError, ValueError):
+                            pass
             if outcome == "fail":
                 block_left = read_block_left(scope)
+                bg_w = layout.bg_width or int(meta.get("bgNaturalWidth") or 310)
+                tw = layout.track_width or layout.bg_box_width
+                expand_targets_from_gap_x(
+                    targets,
+                    seen_targets,
+                    float(gap_x),
+                    bg_width=bg_w,
+                    block_width=layout.block_width,
+                    track_width=tw,
+                    handle_width=layout.handle_width,
+                    offset_px=layout.offset_px,
+                    track_travel=track_travel,
+                )
                 if block_left > 0:
-                    landed = block_left_to_slider(
+                    expand_targets_from_block_landing(
+                        targets,
+                        seen_targets,
                         block_left,
-                        bg_width=layout.bg_width or int(meta.get("bgNaturalWidth") or 310),
+                        bg_width=bg_w,
                         block_width=layout.block_width,
-                        track_width=layout.track_width or layout.bg_box_width,
+                        track_width=tw,
                         handle_width=layout.handle_width,
+                        offset_px=layout.offset_px,
+                        track_travel=track_travel,
                     )
-                    if landed > 0:
-                        expand_targets_from_landing(
-                            targets, seen_targets, landed, track_travel
-                        )
                 elif final_left > 0:
                     expand_targets_from_landing(
                         targets, seen_targets, final_left, track_travel
                     )
             idx += 1
 
+        if not dragged:
+            self._notify("滑块未能拖动，稍后重试…")
+            return False, "retry"
         self._notify("拼图未对齐，将刷新换图重试…")
-        return False
+        return False, "exhausted"
 
 
 def create_captcha_provider(

@@ -77,12 +77,18 @@ READ_BLOCK_LEFT_JS = """
 
 # Fine-tune on the same captcha: coarse steps first, then fine (slider track px).
 FINE_TUNE_SLIDER_STEPS = (
-    15, -15, 20, -20, 10, -10, 25, -25,
-    6, -6, 12, -12, 18, -18, 3, -3, 2, -2, 4, -4,
+    8, -8, 12, -12, 16, -16, 20, -20,
+    4, -4, 6, -6, 10, -10, 14, -14,
+    2, -2, 3, -3, 1, -1, 5, -5,
 )
-# After a failed drag, search ±N px around the slider position that landed.
-ADAPTIVE_FAIL_STEPS = (2, -2, 4, -4, 6, -6, 8, -8, 10, -10, 12, -12)
-MAX_TRIES_PER_CAPTCHA = 22
+# After a failed drag, nudge in image px then convert to slider targets.
+ADAPTIVE_GAP_STEPS = (
+    1, -1, 2, -2, 3, -3, 4, -4, 5, -5,
+    6, -6, 8, -8, 10, -10, 12, -12, 14, -14,
+)
+# Slider-track px fallback when block.left is unavailable.
+ADAPTIVE_FAIL_STEPS = (1, -1, 2, -2, 3, -3, 4, -4, 6, -6, 8, -8, 10, -10)
+MAX_TRIES_PER_CAPTCHA = 32
 
 
 @dataclass
@@ -106,6 +112,14 @@ class GapDetectionResult:
     confidence: float
     method: str
     candidates: dict[str, int]
+    alternates: tuple[float, ...] = ()
+
+
+def puzzle_block_width(puzzle: np.ndarray | None, fallback: int = 62) -> int:
+    if puzzle is None or puzzle.size == 0:
+        return fallback
+    _, _, width = _prepare_puzzle(puzzle)
+    return max(int(width), 8)
 
 
 def decode_data_url(data_url: str, *, keep_alpha: bool = False) -> np.ndarray:
@@ -127,6 +141,24 @@ def decode_data_url(data_url: str, *, keep_alpha: bool = False) -> np.ndarray:
     return image
 
 
+def _crop_to_alpha_bbox(
+    puzzle_gray: np.ndarray,
+    mask: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Crop full-size block canvas down to the visible puzzle piece."""
+    if mask is None or not mask.any():
+        return puzzle_gray, mask
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        return puzzle_gray, mask
+    x, y, w, h = cv2.boundingRect(coords)
+    if w <= 0 or h <= 0:
+        return puzzle_gray, mask
+    cropped_gray = puzzle_gray[y : y + h, x : x + w]
+    cropped_mask = mask[y : y + h, x : x + w]
+    return cropped_gray, cropped_mask
+
+
 def _prepare_puzzle(
     puzzle: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray | None, int]:
@@ -138,7 +170,13 @@ def _prepare_puzzle(
     else:
         puzzle_gray = cv2.cvtColor(puzzle, cv2.COLOR_BGR2GRAY)
         mask = None
+    puzzle_gray, mask = _crop_to_alpha_bbox(puzzle_gray, mask)
     return puzzle_gray, mask, int(puzzle_gray.shape[1])
+
+
+def _enhance_gray(gray: np.ndarray) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
 
 
 def _search_margin(block_w: int, width: int) -> int:
@@ -255,6 +293,286 @@ def refine_gap_x(bg_gray: np.ndarray, block_w: int, rough_x: int, *, window: int
     return int(round(refine_gap_subpixel(bg_gray, block_w, rough_x, window=window)))
 
 
+def _puzzle_band(bg_gray: np.ndarray, puzzle_gray: np.ndarray) -> tuple[int, int]:
+    ph, pw = puzzle_gray.shape[:2]
+    bh = bg_gray.shape[0]
+    y0 = max(0, (bh - ph) // 2)
+    y1 = min(bh, y0 + ph)
+    return y0, y1
+
+
+def _hole_fill_scores(
+    bg_gray: np.ndarray,
+    puzzle_gray: np.ndarray,
+    mask: np.ndarray | None,
+    skip: int,
+) -> list[tuple[int, float]]:
+    """Masked mean absolute diff at each x — peak marks the hole."""
+    ph, pw = puzzle_gray.shape[:2]
+    y0, y1 = _puzzle_band(bg_gray, puzzle_gray)
+    puzzle_band = puzzle_gray[: y1 - y0, :]
+    bg_band = bg_gray[y0:y1, :]
+    if mask is not None:
+        m = mask[: y1 - y0, :] > 128
+    else:
+        m = np.ones(puzzle_band.shape, dtype=bool)
+
+    if not m.any():
+        return []
+
+    w = bg_gray.shape[1]
+    scores: list[tuple[int, float]] = []
+    puzzle_f = puzzle_band.astype(np.float32)
+    for x in range(skip, w - pw + 1):
+        patch = bg_band[:, x : x + pw].astype(np.float32)
+        diff = np.abs(patch - puzzle_f)
+        score = float(diff[m].mean())
+        scores.append((x, score))
+    return scores
+
+
+def _subpixel_peak_from_scores(scores: list[tuple[int, float]]) -> tuple[float, float]:
+    """Return (subpixel_x, peak_score) from a score curve (higher = better)."""
+    if not scores:
+        return 0.0, 0.0
+    best_i = max(range(len(scores)), key=lambda i: scores[i][1])
+    best_x, best_score = scores[best_i]
+    if best_score <= 0 or len(scores) < 3:
+        return float(best_x), best_score
+    if 0 < best_i < len(scores) - 1:
+        x0, y0 = scores[best_i - 1]
+        x1, y1 = scores[best_i]
+        x2, y2 = scores[best_i + 1]
+        denom = y0 - 2.0 * y1 + y2
+        if abs(denom) > 1e-3:
+            delta = 0.5 * (y0 - y2) / denom
+            delta = max(-0.9, min(0.9, delta))
+            return float(x1) + delta, y1
+    return float(best_x), best_score
+
+
+def _top_peaks_from_scores(
+    scores: list[tuple[int, float]],
+    *,
+    top_k: int = 3,
+    min_sep: int = 18,
+    min_ratio: float = 0.82,
+) -> list[tuple[float, float]]:
+    if not scores:
+        return []
+    peak_x, peak_score = _subpixel_peak_from_scores(scores)
+    peaks: list[tuple[float, float]] = [(peak_x, peak_score)]
+    if peak_score <= 0:
+        return peaks
+
+    work = scores.copy()
+    pw = min_sep
+    for _ in range(top_k - 1):
+        best_i = max(range(len(work)), key=lambda i: work[i][1])
+        bx, bs = work[best_i]
+        if bs < peak_score * min_ratio:
+            break
+        if not any(abs(bx - px) >= min_sep for px, _ in peaks):
+            break
+        peaks.append((float(bx), bs))
+        x0 = max(0, best_i - pw)
+        x1 = min(len(work), best_i + pw + 1)
+        for i in range(x0, x1):
+            work[i] = (work[i][0], -1.0)
+    return peaks
+
+
+def _detect_gap_by_hole_fill_diff(
+    bg_gray: np.ndarray,
+    puzzle_gray: np.ndarray,
+    mask: np.ndarray | None,
+    block_w: int,
+    skip: int,
+) -> tuple[int, float, list[tuple[int, float]]]:
+    """
+    Hole is filled with flat gray — masked diff between puzzle piece and bg is maximal there.
+    """
+    scores = _hole_fill_scores(bg_gray, puzzle_gray, mask, skip)
+    if not scores:
+        return skip, 0.0, scores
+    gap_x_float, best_score = _subpixel_peak_from_scores(scores)
+    return int(round(gap_x_float)), best_score, scores
+
+
+def _pure_white_mask(bg_bgr: np.ndarray) -> np.ndarray:
+    """Pure white hole fill (#FFF) — GACC gap is solid white, not light gray."""
+    b, g, r = cv2.split(bg_bgr)
+    pure = (r >= 248) & (g >= 248) & (b >= 248)
+    return pure.astype(np.uint8) * 255
+
+
+def _white_mask(bg_bgr: np.ndarray) -> np.ndarray:
+    """Slightly relaxed white for legacy rim helper."""
+    return _pure_white_mask(bg_bgr)
+
+
+def _hole_search_skip(block_w: int, width: int) -> int:
+    """Target hole is always right of the puzzle piece parked at x=0."""
+    return max(_search_margin(block_w, width), block_w + 10)
+
+
+def _white_hole_scores(
+    bg_bgr: np.ndarray,
+    block_w: int,
+    skip: int,
+    *,
+    puzzle_gray: np.ndarray | None = None,
+    mask: np.ndarray | None = None,
+) -> list[tuple[int, float]]:
+    """
+    Slide a window over the bg; peak x = where the puzzle slot is filled with pure white.
+    """
+    h, w = bg_bgr.shape[:2]
+    bright = _pure_white_mask(bg_bgr)
+    if puzzle_gray is not None and puzzle_gray.size > 0:
+        ph, pw = puzzle_gray.shape[:2]
+        y0, y1 = _puzzle_band(bg_bgr, puzzle_gray)
+        band = bright[y0:y1, :]
+        if mask is not None:
+            m = mask[: y1 - y0, :] > 128
+        else:
+            m = np.ones((y1 - y0, pw), dtype=bool)
+    else:
+        ph, pw = h, block_w
+        y0, y1 = max(1, h // 10), min(h - 1, 9 * h // 10)
+        band = bright[y0:y1, :]
+        m = None
+
+    if band.size == 0:
+        return []
+
+    scores: list[tuple[int, float]] = []
+    win_w = pw if puzzle_gray is not None else block_w
+    for x in range(skip, w - win_w - 1):
+        patch = band[:, x : x + win_w]
+        if m is not None and m.shape == patch.shape:
+            if not m.any():
+                continue
+            ratio = float((patch[m] > 0).mean())
+        else:
+            core = patch[4:-4, 8 : win_w - 8] if patch.shape[1] > 20 else patch
+            if core.size == 0:
+                continue
+            ratio = float((core > 0).mean())
+        if ratio < 0.42:
+            continue
+        scores.append((x, ratio * 10000.0))
+    return scores
+
+
+def _detect_gap_by_white_hole(
+    bg_bgr: np.ndarray,
+    block_w: int,
+    skip: int,
+    *,
+    puzzle_gray: np.ndarray | None = None,
+    mask: np.ndarray | None = None,
+) -> tuple[int | None, float, list[tuple[int, float]]]:
+    scores = _white_hole_scores(
+        bg_bgr, block_w, skip, puzzle_gray=puzzle_gray, mask=mask
+    )
+    if not scores:
+        return None, 0.0, scores
+    gap_x_float, best_score = _subpixel_peak_from_scores(scores)
+    if best_score < 4200.0:
+        return None, best_score, scores
+    return int(round(gap_x_float)), best_score, scores
+
+
+def _detect_gap_by_white_blob(
+    bg_bgr: np.ndarray,
+    block_w: int,
+    skip: int,
+) -> int | None:
+    """Find pure-white blob roughly puzzle-sized on the right side."""
+    mask = _pure_white_mask(bg_bgr)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    target_area = block_w * max(bg_bgr.shape[0] // 2, 40)
+    best_x: int | None = None
+    best_score = -1.0
+    for cnt in contours:
+        x, _y, bw, bh = cv2.boundingRect(cnt)
+        if x < skip:
+            continue
+        area = float(cv2.contourArea(cnt))
+        if area < target_area * 0.15:
+            continue
+        if bw < block_w * 0.45 or bw > block_w * 2.2:
+            continue
+        size_fit = 1.0 - min(abs(bw - block_w) / max(block_w, 1), 1.0)
+        score = area * (0.5 + size_fit * 0.5)
+        if score > best_score:
+            best_score = score
+            best_x = x
+    return best_x
+
+
+def _white_rim_scores(
+    bg_bgr: np.ndarray,
+    block_w: int,
+    skip: int,
+) -> list[tuple[int, float]]:
+    """
+    Score each x by paired vertical white edges (left + right of puzzle slot).
+    The GACC hole is outlined in white — this is the most reliable cue.
+    """
+    h, w = bg_bgr.shape[:2]
+    bright = _white_mask(bg_bgr)
+    y0, y1 = max(1, h // 10), min(h - 1, 9 * h // 10)
+    band = bright[y0:y1, :].astype(np.float32)
+    if band.size == 0:
+        return []
+
+    scores: list[tuple[int, float]] = []
+    for x in range(skip, w - block_w - 2):
+        left_edge = float(band[:, x : x + 4].sum())
+        right_edge = float(band[:, x + block_w - 4 : x + block_w].sum())
+        inner_white = float(band[:, x + 10 : x + block_w - 10].sum())
+        if left_edge < 800 or right_edge < 800:
+            continue
+        outer_ring = left_edge + right_edge
+        paired = (left_edge * right_edge) ** 0.5
+        score = paired + outer_ring * 0.12 - inner_white * 0.45
+        scores.append((x, score))
+    return scores
+
+
+def _detect_gap_by_white_rim(
+    bg_bgr: np.ndarray,
+    block_w: int,
+    skip: int,
+) -> tuple[int | None, float, list[tuple[int, float]]]:
+    """Detect puzzle hole via bright white outline ring on the background image."""
+    scores = _white_rim_scores(bg_bgr, block_w, skip)
+    if not scores:
+        return None, 0.0, scores
+    gap_x_float, best_score = _subpixel_peak_from_scores(scores)
+    if best_score < 35.0:
+        return None, best_score, scores
+    return int(round(gap_x_float)), best_score, scores
+
+
+def _detect_gap_global_scan(bg_gray: np.ndarray, block_w: int) -> int:
+    w = bg_gray.shape[1]
+    margin = _search_margin(block_w, w)
+    best_x = margin
+    best_score = -1.0
+    for x in range(margin, w - block_w - 2):
+        score = _combined_score_at_x(bg_gray, block_w, x)
+        if score > best_score:
+            best_score = score
+            best_x = x
+    return int(best_x)
+
+
 def _detect_hole_by_notch(bg_gray: np.ndarray, block_w: int) -> int:
     """Find puzzle hole: darker fill + strong vertical borders."""
     w = bg_gray.shape[:2][1]
@@ -368,6 +686,26 @@ def _template_peaks(
     return peaks
 
 
+def _detect_by_masked_template(
+    bg_gray: np.ndarray,
+    puzzle_gray: np.ndarray,
+    mask: np.ndarray | None,
+    skip: int,
+) -> int | None:
+    bg = _enhance_gray(bg_gray)
+    tmpl = _enhance_gray(puzzle_gray)
+    if mask is not None and mask.any():
+        result = cv2.matchTemplate(bg, tmpl, cv2.TM_CCORR_NORMED, mask=mask)
+    else:
+        result = cv2.matchTemplate(bg, tmpl, cv2.TM_CCOEFF_NORMED)
+    if skip < result.shape[1]:
+        result[:, :skip] = -1.0
+    _min, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+    if max_val > 0.28:
+        return int(max_loc[0])
+    return None
+
+
 def _detect_by_edge_template(
     bg_gray: np.ndarray,
     puzzle_gray: np.ndarray,
@@ -443,70 +781,166 @@ def detect_gap_x_detailed(
     votes: list[tuple[int, float]] = []
 
     notch_x = _detect_hole_by_notch(bg_gray, block_w)
-    method_scores["notch"] = notch_x
-    votes.append((notch_x, 3.2))
-
     edge_x = _detect_hole_by_edge_pair(bg_gray, block_w)
+    global_x = _detect_gap_global_scan(bg_gray, block_w)
+    method_scores["notch"] = notch_x
     method_scores["edge_pair"] = edge_x
-    votes.append((edge_x, 2.8))
+    method_scores["global"] = global_x
+    votes.extend([(notch_x, 2.5), (edge_x, 2.2), (global_x, 2.0)])
 
-    if abs(notch_x - edge_x) <= 12:
-        anchor = int(round((notch_x + edge_x) / 2))
-        method_scores["notch_edge_anchor"] = anchor
-        votes.append((anchor, 5.0))
-
-    template_peaks: list[tuple[int, float]] = []
-    use_texture_template = abs(notch_x - edge_x) > 18
+    hole_diff_x: int | None = None
+    hole_scores: list[tuple[int, float]] = []
+    hole_diff_strength = 0.0
+    alternates: list[float] = []
     if puzzle_gray is not None:
+        hole_diff_x, hole_diff_strength, hole_scores = _detect_gap_by_hole_fill_diff(
+            bg_gray, puzzle_gray, mask, block_w, skip
+        )
+        method_scores["hole_diff"] = hole_diff_x
+        method_scores["hole_strength"] = int(hole_diff_strength)
+        votes.append((hole_diff_x, 6.0 + min(hole_diff_strength / 35.0, 2.0)))
+
+        for px, ps in _top_peaks_from_scores(hole_scores, top_k=3)[1:]:
+            alternates.append(px)
+            votes.append((int(round(px)), 2.5 + min(ps / hole_diff_strength, 1.0) * 1.5))
+
+        tmpl_x = _detect_by_masked_template(bg_gray, puzzle_gray, mask, skip)
+        if tmpl_x is not None:
+            method_scores["masked_template"] = tmpl_x
+            if abs(tmpl_x - hole_diff_x) <= 12:
+                votes.append((tmpl_x, 4.5))
+            elif hole_diff_strength < 25:
+                votes.append((tmpl_x, 3.0))
+
         align_x = _detect_by_puzzle_edge_align(bg_gray, puzzle_gray, mask, block_w, skip)
         if align_x is not None:
             method_scores["puzzle_edge_align"] = align_x
-            w = 3.4 if abs(align_x - notch_x) <= 20 else 2.2
-            votes.append((align_x, w))
+            votes.append((align_x, 2.8))
 
-        edge_tpl = _detect_by_edge_template(bg_gray, puzzle_gray, mask, skip)
-        if edge_tpl is not None:
-            method_scores["edge_template"] = edge_tpl
-            tpl_w = 2.4
-            if abs(edge_tpl - notch_x) > 28:
-                tpl_w *= 0.35
-            votes.append((edge_tpl, tpl_w))
+    hole_skip = _hole_search_skip(block_w, bg_gray.shape[1])
 
-        if use_texture_template:
-            template_peaks = _template_peaks(bg_gray, puzzle_gray, mask, skip)
-            for rank, (x, conf) in enumerate(template_peaks):
-                method_scores[f"template_{rank}"] = x
-                weight = 1.2 + conf * 1.5 * (0.85**rank)
-                if rank == 0 and abs(x - notch_x) > 28:
-                    weight *= 0.25
-                votes.append((x, weight))
+    white_x: int | None = None
+    white_scores: list[tuple[int, float]] = []
+    white_strength = 0.0
+    white_x_float = 0.0
+    white_x, white_strength, white_scores = _detect_gap_by_white_hole(
+        background,
+        block_w,
+        hole_skip,
+        puzzle_gray=puzzle_gray,
+        mask=mask,
+    )
+    if white_scores:
+        white_x_float, _ = _subpixel_peak_from_scores(white_scores)
+        if white_x is None and white_strength >= 4200.0:
+            white_x = int(round(white_x_float))
 
-    if abs(notch_x - edge_x) <= 12:
-        rough_x = int(round((notch_x + edge_x) / 2))
+    blob_x = _detect_gap_by_white_blob(background, block_w, hole_skip)
+    if blob_x is not None:
+        method_scores["white_blob"] = blob_x
+        votes.append((blob_x, 7.5))
+        if white_x is not None and abs(blob_x - white_x) <= 16:
+            white_x_float = (white_x_float + blob_x) / 2.0
+            white_x = int(round(white_x_float))
+        elif white_x is None:
+            white_x = blob_x
+            white_x_float = float(blob_x)
+            white_strength = 5000.0
+
+    if white_x is not None:
+        method_scores["white_hole"] = white_x
+        method_scores["white_strength"] = int(white_strength)
+        votes.append((white_x, 9.0 + min(white_strength / 5000.0, 2.0)))
+        for px, ps in _top_peaks_from_scores(white_scores, top_k=3)[1:]:
+            alternates.append(px)
+            votes.append((int(round(px)), 3.0 + min(ps / max(white_strength, 1.0), 1.0) * 2.0))
+
+    primary = [x for x in (white_x, hole_diff_x, notch_x, edge_x) if x is not None]
+    if len(primary) >= 2:
+        spread = max(primary) - min(primary)
     else:
-        gap_x = _vote_gap(votes)
-        rough_x = max(skip, min(gap_x, bg_gray.shape[1] - block_w - 2))
-    gap_x_float = refine_gap_subpixel(bg_gray, block_w, rough_x)
+        spread = 999
+
+    strong_white = white_x is not None and white_strength >= 4200.0
+    if strong_white:
+        gap_x_float = white_x_float if white_scores else float(white_x)
+        rough_x = int(round(gap_x_float))
+        if blob_x is not None and abs(blob_x - rough_x) <= 12:
+            gap_x_float = (gap_x_float + blob_x) / 2.0
+            rough_x = int(round(gap_x_float))
+        method_scores["primary"] = rough_x
+        method = "white_hole"
+    else:
+        method = "ensemble"
+        strong_hole = hole_diff_x is not None and hole_diff_strength >= 18.0
+        if strong_hole:
+            peers = [
+                x
+                for x in (white_x, notch_x, edge_x, method_scores.get("masked_template"))
+                if x is not None
+            ]
+            if sum(1 for x in peers if abs(x - hole_diff_x) > 24) >= 2:
+                strong_hole = False
+        if strong_hole:
+            rough_x = hole_diff_x
+            if white_x is not None and abs(white_x - hole_diff_x) <= 14:
+                rough_x = int(round((hole_diff_x + white_x) / 2))
+            elif tmpl := method_scores.get("masked_template"):
+                if abs(tmpl - hole_diff_x) <= 10:
+                    rough_x = int(round((hole_diff_x + tmpl) / 2))
+            method_scores["primary"] = rough_x
+            if hole_scores:
+                gap_x_float, _ = _subpixel_peak_from_scores(hole_scores)
+            else:
+                gap_x_float = refine_gap_subpixel(bg_gray, block_w, rough_x, window=24)
+        elif white_x is not None:
+            gap_x_float = white_x_float if white_scores else float(white_x)
+            rough_x = int(round(gap_x_float))
+            method_scores["primary"] = rough_x
+            method = "white_hole"
+        elif spread <= 18 and hole_diff_x is not None:
+            rough_x = hole_diff_x
+            if white_x is not None and abs(white_x - hole_diff_x) <= 14:
+                rough_x = int(round((hole_diff_x + white_x) / 2))
+            method_scores["primary"] = rough_x
+            gap_x_float = refine_gap_subpixel(bg_gray, block_w, rough_x, window=28)
+        elif spread <= 12:
+            rough_x = int(round(sum(primary) / len(primary)))
+            method_scores["primary"] = rough_x
+            gap_x_float = refine_gap_subpixel(bg_gray, block_w, rough_x, window=28)
+        else:
+            rough_x = _vote_gap(votes)
+            rough_x = max(skip, min(rough_x, bg_gray.shape[1] - block_w - 2))
+            gap_x_float = refine_gap_subpixel(bg_gray, block_w, rough_x, window=32)
+
     gap_x = int(round(gap_x_float))
     method_scores["refined"] = gap_x
-    method_scores["refined_sub"] = int(round(gap_x_float * 10))
 
-    # Confidence: agreement between notch/edge vs final pick
-    agree = sum(1 for x in (notch_x, edge_x) if abs(x - gap_x) <= 12)
-    confidence = 0.35 + agree * 0.25
-    if puzzle_gray is not None:
-        tpl0 = method_scores.get("template_0")
-        if tpl0 is not None and abs(tpl0 - gap_x) <= 12:
-            confidence += 0.15
-        elif template_peaks and abs(template_peaks[0][0] - notch_x) > 28:
-            confidence += 0.1
+    agree = sum(1 for x in primary if abs(x - gap_x) <= 14)
+    confidence = 0.2 + agree * 0.08
+    if strong_white:
+        confidence += 0.48
+    elif white_x is not None and abs(white_x - gap_x) <= 6:
+        confidence += 0.28
+    if hole_diff_x is not None and abs(hole_diff_x - gap_x) <= 8:
+        confidence += 0.08
+    if spread <= 18:
+        confidence += 0.08
+
+    alt_tuple = tuple(
+        sorted(
+            {float(a) for a in alternates if abs(a - gap_x_float) >= 8.0},
+            key=lambda v: abs(v - gap_x_float),
+        )[:2]
+    )
 
     return GapDetectionResult(
         gap_x=gap_x,
         gap_x_float=gap_x_float,
         confidence=min(confidence, 1.0),
-        method="ensemble",
+        method=method,
         candidates=method_scores,
+        alternates=alt_tuple,
     )
 
 
@@ -580,14 +1014,16 @@ def _drag_with_real_mouse(
     page.mouse.down()
     page.wait_for_timeout(80)
 
-    steps = max(28, min(65, int(move / 2.5) or 28))
+    steps = max(32, min(72, int(move / 2.0) or 32))
     for i in range(1, steps + 1):
         t = i / steps
-        ease = 1.0 - (1.0 - t) ** 2.5
+        # Slow ease-in-out: precise landing on last pixels
+        ease = 3.0 * t * t - 2.0 * t * t * t
         cx = start_x + move * ease
-        wobble = 1.2 * np.sin(t * np.pi * 2.5)
+        wobble = 0.8 * np.sin(t * np.pi * 2.0) * (1.0 - t)
         page.mouse.move(cx, start_y + wobble)
-        page.wait_for_timeout(max(6, int(14 - 8 * t)))
+        delay = 18 - int(12 * ease)
+        page.wait_for_timeout(max(5, delay))
 
     page.wait_for_timeout(60)
     page.mouse.up()
@@ -618,8 +1054,12 @@ def drag_captcha_handle(
     target = float(target_offset)
     before = read_slider_offset(eval_scope)
     delta = target - before
+    # Stale offset reads should not skip a real drag.
+    if abs(delta) < 2 and target > 6:
+        before = 0.0
+        delta = target
 
-    if abs(delta) < 2:
+    if abs(delta) < 1:
         return before
 
     start_x = box["x"] + box["width"] / 2
@@ -701,7 +1141,7 @@ def block_left_to_slider(
 
 def _add_target(targets: list[float], seen: set[int], value: float, track_travel: float) -> None:
     ti = int(round(value))
-    if ti in seen or ti < 8 or ti > track_travel:
+    if ti in seen or ti < 1 or ti > track_travel:
         return
     seen.add(ti)
     targets.append(float(ti))
@@ -716,15 +1156,100 @@ def build_initial_targets(base_distance: float, track_travel: float) -> list[flo
     return targets
 
 
+def expand_targets_from_gap_x(
+    targets: list[float],
+    seen: set[int],
+    gap_x: float,
+    *,
+    bg_width: int,
+    block_width: int,
+    track_width: float,
+    handle_width: float,
+    offset_px: float,
+    track_travel: float,
+) -> None:
+    """Nudge around a gap estimate in image px (original detection or block landing)."""
+    for delta in ADAPTIVE_GAP_STEPS:
+        dist = compute_drag_distance(
+            max(0.0, gap_x + delta),
+            bg_width=bg_width,
+            block_width=block_width,
+            track_width=track_width,
+            handle_width=handle_width,
+            offset_px=offset_px,
+        )
+        _add_target(targets, seen, dist, track_travel)
+
+
+def expand_targets_from_block_landing(
+    targets: list[float],
+    seen: set[int],
+    block_left: float,
+    *,
+    bg_width: int,
+    block_width: int,
+    track_width: float,
+    handle_width: float,
+    offset_px: float,
+    track_travel: float,
+) -> None:
+    """After a near-miss, nudge in image px around where the puzzle piece landed."""
+    expand_targets_from_gap_x(
+        targets,
+        seen,
+        block_left,
+        bg_width=bg_width,
+        block_width=block_width,
+        track_width=track_width,
+        handle_width=handle_width,
+        offset_px=offset_px,
+        track_travel=track_travel,
+    )
+
+
+def build_detection_targets(
+    detail: GapDetectionResult,
+    layout: CaptchaLayout,
+    *,
+    track_travel: float,
+) -> list[float]:
+    """Slider targets from primary gap + alternate peaks."""
+    bg_w = layout.bg_width
+    tw = layout.track_width or layout.bg_box_width
+    seen: set[int] = set()
+    targets: list[float] = []
+    gap_values = [detail.gap_x_float, *detail.alternates]
+    for gap in gap_values:
+        dist = compute_drag_distance(
+            gap,
+            bg_width=bg_w,
+            block_width=layout.block_width,
+            track_width=tw,
+            handle_width=layout.handle_width,
+            offset_px=layout.offset_px,
+        )
+        _add_target(targets, seen, dist, track_travel)
+        for step in (12, -12, 8, -8, 5, -5, 3, -3):
+            _add_target(targets, seen, dist + step, track_travel)
+    return targets
+
+
 def expand_targets_from_landing(
     targets: list[float],
     seen: set[int],
     landed_slider: float,
     track_travel: float,
 ) -> None:
-    """After a near-miss, queue small adjustments around where the slider stopped."""
+    """Fallback when block.left is unavailable."""
     for step in ADAPTIVE_FAIL_STEPS:
         _add_target(targets, seen, landed_slider + step, track_travel)
+
+
+def ensure_slider_block_reset(page, handle_locator, scope) -> bool:
+    """Reset slider to start; return False if puzzle block did not return left."""
+    reset_slider_position(page, handle_locator, scope=scope)
+    page.wait_for_timeout(350)
+    return read_block_left(scope) < 8
 
 
 def iter_fine_tune_targets(base_distance: float, track_travel: float) -> list[float]:

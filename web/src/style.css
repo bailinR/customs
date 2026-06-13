@@ -727,6 +727,50 @@ tr:hover td {
   color: #b45309;
 }
 
+.schedule-panel {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.schedule-title {
+  margin: 0 0 10px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.schedule-time-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 6px;
+}
+
+.schedule-time-select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: #1e293b;
+  background: #fff;
+}
+
+.schedule-time-sep {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #64748b;
+  line-height: 1;
+}
+
+.schedule-hint {
+  margin: 8px 0 0;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: #64748b;
+}
+
 .sync-result {
   padding: 8px 10px;
   border-radius: 6px;
