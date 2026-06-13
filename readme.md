@@ -1,156 +1,187 @@
-# customsR — 各国海关/贸易数据同步 MVP
+# customsR
 
-从 [UN Comtrade](https://comtrade.un.org/) 按需拉取各国进出口贸易统计，存入 SQLite，Web 查询与导出 Excel。
+各国海关 / 贸易数据同步与查询 MVP：**UN Comtrade** 按需入库 + **中国海关总署** stats.customs.gov.cn 在线查询采集，Vue 3 前端统一操作。
 
-## 1. 问题定义
+---
 
-| 概念 | 本项目的定义 |
-|------|-------------|
-| **海关数据** | 各国官方**进出口贸易统计**（货值，美元计） |
-| **商品分类** | HS 协调制度，`cmdCode=TOTAL` 表示全商品合计 |
-| **实时** | 按需从 Comtrade 官方 API 拉取已发布数据；非 WebSocket 推送 |
-| **切片** | 最小同步单位：报告国 + 年/月 + 进出口 + 年度/月度 |
-
-## 2. 数据源
-
-| 来源 | 状态 |
-|------|------|
-| **UN Comtrade API**（主） | ✅ 可用，需 `.env` 配置 Key |
-| US Census API | ❌ 403 |
-| **stats.customs.gov.cn**（中国） | ✅ Playwright 半自动（手动滑块验证码） |
-| english.customs.gov.cn | 备用（未接入） |
-
-## 3. 项目结构
-
-```
-customsR/
-├── api/main.py           # FastAPI 服务
-├── comtrade_client.py    # Comtrade 年度/月度 API
-├── comtrade_meta.py      # 国家列表、年份范围
-├── config.py             # 配置与标签
-├── storage.py            # SQLite：trade_records / data_slices
-├── sync_service.py       # 按需切片同步、SSE 进度
-├── slice_meta.py         # 切片状态展示字段
-├── trade_query.py        # 贸易查询 SQL 构建
-├── trade_export.py       # xlsx 导出
-├── gacc_fetcher.py       # 海关总署 Playwright 采集
-├── gacc_parser.py        # 海关 CSV 解析
-├── gacc_storage.py       # gacc_trade_records / gacc_query_jobs
-├── gacc_jobs.py          # 后台采集任务
-├── sync.py               # 可选：五国近 3 年年度批量预同步
-├── docs/API.md           # API 详细文档
-├── web/                  # Vue 3 前端
-├── data/customs.db       # SQLite（git 忽略）
-└── output/               # 脚本导出目录（git 忽略）
-```
-
-## 4. 使用方式
+## 快速开始
 
 ```powershell
 cd d:\project\thinking\customsR
 pip install -r requirements.txt
+# 在项目根目录创建 .env（见下方配置）
+```
 
-# 可选：预同步五国近 3 年年度数据
-python sync.py
+`.env` 至少配置 Comtrade Key（[注册](https://comtradedeveloper.un.org/)）：
 
+```env
+COMTRADE_API_KEY=你的key
+```
+
+```powershell
 # 终端 1：API
 python -m uvicorn api.main:app --reload --port 8000
 
 # 终端 2：前端
-cd web
-npm install
-npm run dev
+cd web && npm install && npm run dev
 ```
 
-浏览器打开 http://localhost:5173
+浏览器打开 http://localhost:5173 · API 文档 http://127.0.0.1:8000/docs · 详细接口见 [docs/API.md](docs/API.md)
 
 ```powershell
-# 单元测试（缓存逻辑 + API 冒烟）
 python -m pytest tests/ -v
 ```
 
-| 区域 | 功能 |
-|------|------|
-| **左侧同步区** | 选国家 / 年度或月度 / 周期，从 Comtrade 拉取入库；支持强制刷新 |
-| **数据查询** | 只读本地库，年度/月度筛选，导出 xlsx |
-| **同步缓存** | 查看 `data_slices`：哪些组合已有数据、官网暂无（负缓存）、失败可重试 |
-| **海关在线查询** | 仿 stats.customs.gov.cn 筛选 → Playwright 弹窗 → 手动验证码 → CSV 入库 |
+---
 
-`.env`：
+## 功能概览
 
-```
-COMTRADE_API_KEY=你的key
+| 模块                 | 说明                                                                           |
+| -------------------- | ------------------------------------------------------------------------------ |
+| **Comtrade 同步**    | 选报告国 / 年或月 / 进出口，从官方 API 拉取写入 SQLite；支持强制刷新、SSE 进度 |
+| **贸易查询**         | 只读本地库，筛选 + 分页 + 导出 xlsx                                            |
+| **同步缓存**         | 查看 `data_slices`：已同步 / 官网暂无（负缓存）/ 失败可重试                    |
+| **海关在线查询**     | 仿 stats.customs.gov.cn 筛选 → Playwright 弹窗 → **自动/手动滑块** → CSV 入库  |
+| **定时任务（前端）** | Comtrade 与海关侧边栏均可设「每日 HH:mm」自动执行（**需保持浏览器页签打开**）  |
 
-# 海关源（可选）
-GACC_BASE_URL=http://stats.customs.gov.cn/
-GACC_BROWSER_CHANNEL=msedge
-GACC_BROWSER_HEADLESS=false
-GACC_CAPTCHA_TIMEOUT_SEC=180
-```
+---
 
-首次使用海关采集需安装 Playwright 浏览器：
+## 数据源
+
+| 来源                                                 | 状态        | 说明                                            |
+| ---------------------------------------------------- | ----------- | ----------------------------------------------- |
+| [UN Comtrade API](https://comtrade.un.org/)          | ✅ 主数据源 | 需 `COMTRADE_API_KEY`                           |
+| [stats.customs.gov.cn](http://stats.customs.gov.cn/) | ✅ 已接入   | Playwright + OpenCV 滑块；SSL 异常时需本机 Edge |
+| US Census API                                        | ❌          | 国内常见 403                                    |
+| english.customs.gov.cn                               | 未接入      | 备用                                            |
+
+---
+
+## 海关采集（GACC）
+
+### 流程
+
+1. 前端「海关在线查询」→ 填筛选条件 → **开始查询**
+2. 本机弹出 **Edge / Chrome**（默认有界面，便于验证码）
+3. 自动识别验证码缺口（**纯白块区域**）并拖动滑块；失败可同图微调或改用手动
+4. 验证通过后自动下载 CSV → 解析入库 → 左侧表格展示
+
+### Playwright 安装（首次）
 
 ```powershell
 pip install playwright
 python -m playwright install msedge
 ```
 
-**海关采集流程**：前端「海关在线查询」Tab → 填筛选条件 → 查询 → **本机弹出 Edge/Chrome** → 手动完成滑动验证码 → 自动导出 CSV → 解析入库 → 页面展示。
+### 验证码相关配置（`.env`）
 
-**API 文档**：详见 [docs/API.md](docs/API.md)，或启动服务后访问 http://127.0.0.1:8000/docs
+| 变量                             | 默认                | 说明                                          |
+| -------------------------------- | ------------------- | --------------------------------------------- |
+| `GACC_CAPTCHA_AUTO`              | `true`              | `false` 则全程手动滑块                        |
+| `GACC_CAPTCHA_AUTO_MAX_ATTEMPTS` | `5`                 | 自动失败多少次后刷新换图 / 转手动             |
+| `GACC_CAPTCHA_FALLBACK_MANUAL`   | `true`              | 自动失败后是否提示用户手动完成                |
+| `GACC_CAPTCHA_OFFSET_PX`         | `0`                 | 滑块轨道像素微调（偏左负、偏右正，常见 ±2~5） |
+| `GACC_CAPTCHA_TIMEOUT_SEC`       | `300`               | 单次验证码等待上限（秒）                      |
+| `GACC_BROWSER_CHANNEL`           | `msedge`（Windows） | 也可 `chrome` / 留空用 Chromium               |
+| `GACC_BROWSER_HEADLESS`          | `false`             | 无头模式（验证码场景不建议）                  |
 
-## 5. 数据存储（SQLite）
+诊断脚本（验证码弹出后运行）：
 
-**库路径**: `data/customs.db`
+```powershell
+python scripts/gacc_captcha_debug.py
+```
+
+输出 `data/gacc_captcha_debug.json` 与 `data/captcha_debug_images/` 截图。
+
+### 相关代码
+
+| 文件                    | 职责                               |
+| ----------------------- | ---------------------------------- |
+| `gacc_fetcher.py`       | Playwright 打开查询页、提交、下载  |
+| `gacc_captcha.py`       | 自动/手动验证码流程                |
+| `gacc_slider_solver.py` | OpenCV 纯白缺口检测 + 滑块距离换算 |
+| `gacc_jobs.py`          | 后台任务与状态回调                 |
+
+---
+
+## 定时任务（前端）
+
+在 **Comtrade 同步侧栏** 与 **海关筛选侧栏** 底部可勾选「启用每日定时」，设置时 / 分。
+
+- 配置保存在浏览器 `localStorage`（`customsR.schedule.comtrade` / `.gacc`）
+- 每 15 秒检查一次，到点且表单完整则自动触发同步或海关查询
+- **限制**：关闭页签或浏览器后不会执行；服务端定时需另行接入 APScheduler / 系统 cron
+
+---
+
+## 项目结构
+
+```
+customsR/
+├── api/main.py              # FastAPI
+├── comtrade_client.py       # Comtrade 年度/月度 API
+├── comtrade_meta.py         # 国家、年份元数据
+├── sync_service.py          # 按需切片同步、SSE
+├── storage.py               # trade_records / data_slices
+├── trade_query.py           # 贸易查询 SQL
+├── trade_export.py          # xlsx 导出
+├── gacc_fetcher.py          # 海关 Playwright 采集
+├── gacc_captcha.py          # 验证码（自动 + 手动）
+├── gacc_slider_solver.py    # 滑块缺口识别
+├── gacc_parser.py / gacc_storage.py / gacc_jobs.py
+├── sync.py                  # 可选：五国近 3 年年度批量预同步
+├── scripts/gacc_captcha_debug.py
+├── docs/API.md
+├── web/                     # Vue 3 + Vite
+├── data/customs.db          # SQLite（git 忽略）
+└── output/                  # 脚本导出（git 忽略）
+```
+
+---
+
+## 概念说明
+
+| 概念                     | 定义                                                     |
+| ------------------------ | -------------------------------------------------------- |
+| **海关数据（Comtrade）** | 各国官方进出口贸易统计，货值美元计                       |
+| **商品分类**             | HS；当前 Comtrade 同步使用 `cmdCode=TOTAL`（全商品合计） |
+| **切片**                 | 最小同步单位：报告国 + 年/月 + 进出口 + 年度/月度        |
+| **负缓存**               | 官网返回空结果时记 `empty`，7 天内不重复请求             |
+
+---
+
+## 数据存储（SQLite）
+
+**路径**：`data/customs.db`
 
 ### trade_records
 
-贸易明细（有数据时写入）。
+Comtrade 贸易明细。
 
-| 字段 | 说明 |
-|------|------|
-| `reporter_code` | 报告国 UN M49 |
-| `partner_code` / `partner_name` | 伙伴国（`0` = World 合计） |
-| `freq_code` | `A` 年度 / `M` 月度 |
-| `year` / `month` | 年度 `month=0`；月度 1–12 |
-| `flow_code` | `X` 出口 / `M` 进口 |
-| `cmd_code` | 默认 `TOTAL`（全商品） |
-| `trade_value_usd` | 贸易额（美元） |
+| 字段                            | 说明                      |
+| ------------------------------- | ------------------------- |
+| `reporter_code`                 | 报告国 UN M49             |
+| `partner_code` / `partner_name` | 伙伴国（`0` = World）     |
+| `freq_code`                     | `A` 年度 / `M` 月度       |
+| `year` / `month`                | 年度 `month=0`；月度 1–12 |
+| `flow_code`                     | `X` 出口 / `M` 进口       |
+| `trade_value_usd`               | 贸易额（美元）            |
 
 ### data_slices
 
-同步任务状态 / 负缓存（**无论是否有明细都会记录**）。
+同步状态（有无论文都会记录）。
 
-| 字段 | 说明 |
-|------|------|
-| `reporter_code, year, month, flow_code, freq_code` | 切片唯一键 |
-| `status` | `ok` / `empty` / `error` |
-| `record_count` | 该切片写入条数 |
-| `fetched_at` | 最近同步时间 |
+| status  | 行为                   |
+| ------- | ---------------------- |
+| `ok`    | 默认不再请求 Comtrade  |
+| `empty` | 7 天内不重复（负缓存） |
+| `error` | 1 天内不重复           |
 
-**缓存策略**
-
-| status | 行为 |
-|--------|------|
-| `ok` | 默认不再请求 Comtrade |
-| `empty` | 7 天内不重复请求（负缓存） |
-| `error` | 1 天内不重复请求 |
-
-勾选「强制刷新」或 TTL 过期后会重新请求 API。
+勾选「强制刷新」或 TTL 过期后重新请求。
 
 ### gacc_trade_records / gacc_query_jobs
 
-海关总署 `stats.customs.gov.cn` 采集结果（HS 8 位 + 伙伴 + 贸易方式 + 注册地）。
-
-| 字段 | 说明 |
-|------|------|
-| `job_id` | 采集任务 ID |
-| `hs_code` / `hs_name` | 商品编码 / 名称 |
-| `partner_code` / `partner_name` | 贸易伙伴 |
-| `trade_mode_*` | 贸易方式 |
-| `reg_place_*` | 收发货人注册地 |
-| `qty1` / `unit1` | 第一数量及单位 |
-| `value` | 美元或人民币货值 |
+海关 HS 8 位级明细（伙伴、贸易方式、注册地、数量、货值等），见库表字段或 [docs/API.md](docs/API.md)。
 
 ### SQL 示例
 
@@ -160,68 +191,37 @@ SELECT trade_value_usd FROM trade_records
 WHERE reporter_code = 842 AND year = 2024 AND month = 12
   AND freq_code = 'M' AND flow_code = 'M' AND partner_code = 0;
 
--- 查看中国 2025 年度是否被标记为官网暂无
+-- 中国 2025 年度是否被标记为官网暂无
 SELECT * FROM data_slices
 WHERE reporter_code = 156 AND year = 2025 AND freq_code = 'A';
 ```
 
-## 6. 同步方式
+---
 
-### Web 按需同步（主流程）
+## 同步方式
 
-- 国家：Comtrade 参考表全部报告国（约 252 个）
-- 年度：`freq_code=A`
-- 月度：`freq_code=M`，可选单月或 `month=0`（全年 12 月 × 进出口 = 24 次 API）
-- 进度：`POST /api/sync/slice/stream` SSE 推送
+| 方式             | 说明                                                                         |
+| ---------------- | ---------------------------------------------------------------------------- |
+| **Web 按需同步** | 约 252 个报告国；年度 `A` / 月度 `M`；`POST /api/sync/slice/stream` SSE 进度 |
+| **sync.py**      | 可选：中美德英日近 3 **年度**，约 30 次 API/轮                               |
+| **前端定时**     | 每日到点自动触发（见上文）                                                   |
 
-### sync.py（可选批量）
+---
 
-- 五国（中美德英日）近 3 **年度**数据
-- 约 5 × 3 × 2 = 30 次 API / 轮
+## API 一览
 
-## 7. 已知局限
+完整说明见 **[docs/API.md](docs/API.md)**。
 
-- 各国报送进度不同（如中国 2024 有数据、2025 常为空）
-- 2025–2026 多数国家 Comtrade 尚无月度/年度数据，同步会得到 `empty` 负缓存
-- 免费 Key：约 10 万条/次、500 次/天
-- 当前仅 `cmdCode=TOTAL`，未做 HS 商品级细分
-
-## 8. API 一览
-
-完整参数、响应示例、SSE 事件见 **[docs/API.md](docs/API.md)**。
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/meta/filters` | 查询页联动筛选项 |
-| GET | `/api/meta/sync-options` | 同步表单选项 |
-| GET | `/api/slices/meta` | 同步缓存页筛选项 |
-| GET | `/api/slices` | 切片状态分页列表 |
-| POST | `/api/sync/slice` | 同步（一次性 JSON） |
-| POST | `/api/sync/slice/stream` | 同步（SSE 进度） |
-| GET | `/api/trade` | 贸易数据分页查询 |
-| GET | `/api/trade/export` | 导出 xlsx（最多 5 万条） |
-| GET | `/api/gacc/meta/options` | 海关查询筛选项 |
-| POST | `/api/gacc/query` | 发起海关 Playwright 采集 |
-| GET | `/api/gacc/jobs/{id}` | 采集任务状态 |
-| GET | `/api/gacc/trade` | 海关明细分页查询 |
-
-## 9. 演示建议（面试 / 验收）
-
-1. **USA · 2024 · Monthly · December** → 同步 → 查询 → 导出 xlsx  
-2. **China · 2025 · Annual** → 同步 → 同步缓存页见 `empty` 负缓存  
-3. **海关在线查询** → 进口 · 2024年12月 · 美元 → 弹窗验证码 → 查看 HS 级明细  
-4. 同一组合再次同步 → 命中缓存，不重复打 API（除非强制刷新）
-
-## 10. 扩展方向
-
-- [x] 按需切片同步 + 空结果负缓存
-- [x] 年度 / 月度 + All of year
-- [x] SSE 同步进度
-- [x] 查询结果导出 xlsx
-- [x] 同步缓存页（data_slices）
-- [x] 单元测试（`pytest`，见 `tests/`）
-- [x] 海关总署 stats.customs.gov.cn（Playwright + 手动验证码）
-- [ ] HS 商品级采集（Comtrade `cmdCode` 非 TOTAL）
-- [ ] 中国海关英文站补充源
-- [ ] APScheduler 定时同步
+| 方法 | 路径                     | 说明         |
+| ---- | ------------------------ | ------------ |
+| GET  | `/api/health`            | 健康检查     |
+| GET  | `/api/meta/filters`      | 查询页筛选项 |
+| GET  | `/api/meta/sync-options` | 同步表单选项 |
+| GET  | `/api/slices`            | 切片缓存分页 |
+| POST | `/api/sync/slice/stream` | 同步（SSE）  |
+| GET  | `/api/trade`             | 贸易数据查询 |
+| GET  | `/api/trade/export`      | 导出 xlsx    |
+| GET  | `/api/gacc/meta/options` | 海关筛选项   |
+| POST | `/api/gacc/query`        | 发起海关采集 |
+| GET  | `/api/gacc/jobs/{id}`    | 任务状态     |
+| GET  | `/api/gacc/trade`        | 海关明细分页 |

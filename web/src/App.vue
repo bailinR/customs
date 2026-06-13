@@ -871,7 +871,8 @@ function loadSchedule(mode) {
     const data = JSON.parse(raw);
     if (typeof data.enabled === "boolean") target.enabled = data.enabled;
     if (typeof data.time === "string" && data.time) target.time = data.time;
-    if (typeof data.lastRunKey === "string") target.lastRunKey = data.lastRunKey;
+    if (typeof data.lastRunKey === "string")
+      target.lastRunKey = data.lastRunKey;
   } catch {
     /* ignore corrupt localStorage */
   }
@@ -1390,11 +1391,7 @@ onUnmounted(() => {
             </div>
             <p class="schedule-hint">
               {{
-                scheduleHint(
-                  comtradeSchedule,
-                  syncFormReady,
-                  syncState.syncing,
-                )
+                scheduleHint(comtradeSchedule, syncFormReady, syncState.syncing)
               }}
             </p>
           </section>
